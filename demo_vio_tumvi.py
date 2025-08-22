@@ -48,6 +48,9 @@ def image_stream(imagedir, imagestamp, enable_h5, h5path, calib, stride):
 
             if len(calib) > 4:
                 m1, m2 = cv2.fisheye.initUndistortRectifyMap(K,calib[4:],np.eye(3),Kn,(512,512),cv2.CV_32FC1)
+                #we need to find out what is image dimension for undistortion (512,512)
+                #CV_32FC1 is the type of the output map for float 32 bit point
+                #
                 image = cv2.remap(image, m1, m2, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
 
             tt = float(image_dict[imfile]) /1e9

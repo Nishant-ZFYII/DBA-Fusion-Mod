@@ -46,7 +46,7 @@ def image_stream(imagedir, imagestamp, enable_h5, h5path, calib, stride):
             tt = float(image_dict[imfile])
 
             h0, w0, _ = image.shape
-            h1 = int(h0 * np.sqrt((384 * 512) / (h0 * w0)))
+            h1 = int(h0 * np.sqrt((384 * 512) / (h0 * w0))) #384*512 is aspect ratio of the input image they have chosen. MOD_POS
             w1 = int(w0 * np.sqrt((384 * 512) / (h0 * w0)))
 
             image = cv2.resize(image, (w1, h1))
@@ -59,11 +59,11 @@ def image_stream(imagedir, imagestamp, enable_h5, h5path, calib, stride):
 
             yield tt, image[None], intrinsics
     else:
-        ccount = 0
+        #ccount = 0
         h5_f = h5py.File(h5path,'r')
         all_keys = sorted(list(h5_f.keys()))
         for key in all_keys:
-            ccount += 1
+            #ccount += 1
             yield pickle.loads(np.array(h5_f[key]))
 
 if __name__ == '__main__':
