@@ -1,6 +1,24 @@
 #currently the VIO is turned off and we don't imu buffer . TRY TO TURN IT ON
 #try tweaking zupt logic for better imu drift correction
 #try tweaking the number of iterations for non keyframe update and keyframe update. self.iters1 and self.iters2 (both are for nonkey frames)
+#Priority with ZUPT:
+#If a real ODO sample exists and is near‑synchronized, you’ll append that too. The optimizer will naturally reconcile both 
+# (the ZUPT only fires under “stationary + no visual for long” conditions; in practice if you have real ODO at that 
+# instant and it’s non‑zero, the ZUPT condition likely wouldn’t have passed).
+#prediction for next frame can be changed currently uses the current pose
+#print("IMU excitation not enough!",var_g) -> make it more robust for the production code
+'''
+
+Frontend -> One Frame Just arrived
+1. ingests sensor up to the frame time
+2. predicts the pose (IMU)
+3. maintains the factor graph (add/remove edges)
+4. runs a few local BA/update iterations
+5. logs/plots output
+6. does book-keeping (keyframe acceptance, window init, VI/GNSS init, prep for next loop)
+
+'''
+
 
 import torch
 import torchvision
@@ -199,36 +217,47 @@ class DBAFusionFrontend:
         """
         #frame and state counters
         self.count += 1
-        self.t1 += 1
+        self.t1 += 1 #right edge of the active window (index of the new frame).
 
         #imu reinitialization cost
         #tracks the timestamp of the last imu init. Track this to find if we neeed to trigger a new one.
         if self.video.imu_enabled and (self.video.tstamp[self.t1-1] - self.video.vi_init_time > 5.0):
-            self.video.reinit = True
-            self.video.vi_init_time = 1e9
+            self.video.reinit = True #flag to reset VIO
+            self.video.vi_init_time = 1e9 #most probably won't be needed as this is 31 years in future
 
         ## new frame comes, append IMU
-        cur_t = float(self.video.tstamp[self.t1-1].detach().cpu())
+        cur_t = float(self.video.tstamp[self.t1-1].detach().cpu()) 
         self.video.logger.info('predict %f' %cur_t)
 
-        while self.all_imu[self.cur_imu_ii][0] < cur_t:
+        
+
+        while self.all_imu[self.cur_imu_ii][0] < cur_t: # all the frames until the current timestamp
             ## high-frequency output
             # predict the pose of skipped frames through IMU preintegration
             if self.high_freq_output and self.video.imu_enabled: 
+                #here we check if the IMU is synced. During high freq output sometimes the timestamp for imu is greater
+                #than that of the image frame. It means we have passed the image frame in the imu system. Occurs if imu is running at a higher frequency than the camera
                 if self.all_imu[self.cur_imu_ii][0] > float(self.all_stamp[self.cur_stamp_ii][0]):
-                    self.video.state.append_imu_temp(float(self.all_stamp[self.cur_stamp_ii][0]),\
-                                    self.all_imu[self.cur_imu_ii][4:7],\
-                                    self.all_imu[self.cur_imu_ii][1:4]/180*math.pi,True)
+                    self.video.state.append_imu_temp(
+                        float(self.all_stamp[self.cur_stamp_ii][0]),      # timestamp of the current image frame
+                        self.all_imu[self.cur_imu_ii][4:7],              # measured acceleration (from IMU data)
+                        self.all_imu[self.cur_imu_ii][1:4]/180*math.pi,  # measured angular velocity (converted from degrees to radians)
+                        True                                             # flag to trigger pose prediction
+                    )
+                    #check if the current image timestamp is greather that the state buffer 
+                    #AND  also check if the difference between the two is significant enough
+                    #ensures that pose prediction is done only for new frames that have not been processed before
                     if float(self.all_stamp[self.cur_stamp_ii][0]) > self.video.state.timestamps[-1] and\
                           math.fabs(cur_t - float(self.all_stamp[self.cur_stamp_ii][0]))>1e-3:
-                        pose_temp = self.video.state.pose_temp
-                        ppp = pose_temp.pose().translation()
-                        qqq = Rotation.from_matrix(pose_temp.pose().rotation().matrix()).as_quat()
+                        pose_temp = self.video.state.pose_temp #predicted pose at image timestamp
+                        ppp = pose_temp.pose().translation() # extract translation
+                        qqq = Rotation.from_matrix(pose_temp.pose().rotation().matrix()).as_quat() #extract rotation as quaternion
+                        # logging
                         line = '%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f'%(float(self.all_stamp[self.cur_stamp_ii][0]),ppp[0],ppp[1],ppp[2]\
                                             ,qqq[0],qqq[1],qqq[2],qqq[3])
-                        if self.video.gnss_init_t1>0:
-                            p = self.video.ten0 + np.matmul(trans.Cen(self.video.ten0), ppp)
-                            line += ' %.6f %.6f %.6f'% (p[0],p[1],p[2]) 
+                        if self.video.gnss_init_t1>0: #GNSS init time and global coordinates are available
+                            p = self.video.ten0 + np.matmul(trans.Cen(self.video.ten0), ppp) #convert local to global coordinates rotation + translation
+                            line += ' %.6f %.6f %.6f'% (p[0],p[1],p[2])  #logg
                         self.result_file.writelines(line+'\n')
                         # self.result_file.flush()
                     self.cur_stamp_ii += 1
@@ -240,27 +269,37 @@ class DBAFusionFrontend:
                                     self.all_imu[self.cur_imu_ii][4:7],\
                                     self.all_imu[self.cur_imu_ii][1:4]/180*math.pi)
             self.cur_imu_ii += 1
+
+        ## append IMU at the image time
         self.video.state.append_imu(cur_t,\
                                     self.all_imu[self.cur_imu_ii][4:7],\
                                     self.all_imu[self.cur_imu_ii][1:4]/180*math.pi)
         self.video.state.append_img(cur_t)
         
         ## append GNSS
-        if len(self.all_gnss) > 0: gnss_found = bisect.bisect(self.all_gnss[:,0],cur_t - 1e-6)
-        else: gnss_found = -1        
-        if gnss_found > 0 and self.all_gnss[gnss_found,0] - cur_t < 0.01 :
+        if len(self.all_gnss) > 0: gnss_found = bisect.bisect(self.all_gnss[:,0],cur_t - 1e-6) #find the index of the first GNSS timestamp greater than current image timestamp
+        else: gnss_found = -1         
+        if gnss_found > 0 and self.all_gnss[gnss_found,0] - cur_t < 0.01 : #check if the timestamp is less than 10ms
             self.video.state.append_gnss(cur_t,self.all_gnss[gnss_found,1:4])
 
-        ## append ZUPT
-        if self.zupt and self.video.state.preintegrations[self.t1-3].deltaTij() > 3.0:
+        #makes sure we attach this only when gnss timestamps are aligned
+
+        ## append ZUPT zero velocity update for IMU drift correction when device is stationary
+        #if zupt is enabled and time is greater than 3 seconds check velocity norm
+        # append a zero velocity measure to the odom buffer at curr timestamp
+        #helps in beckend factor graph to constraint velocity to zero when drift is not moving
+        if self.zupt and self.video.state.preintegrations[self.t1-3].deltaTij() > 3.0: 
             if np.linalg.norm(self.video.state.vs[self.t1-2]) < 0.025:
                 self.video.state.append_odo(cur_t,np.array([.0,.0,.0]))
 
-        ## append ODO
-        if len(self.all_odo) > 0: odo_found = bisect.bisect(self.all_odo[:,0],cur_t - 1e-6)
+        ## append ODO 
+        #integrate external odom data like wheel encoders.
+        if len(self.all_odo) > 0: odo_found = bisect.bisect(self.all_odo[:,0],cur_t - 1e-6) #find the first odom timestamp greaten than current time 
         else: odo_found = -1        
-        if odo_found > 0 and self.all_odo[odo_found,0] - cur_t < 0.01 :
-            self.video.state.append_odo(cur_t,self.all_odo[odo_found,1:4])
+        if odo_found > 0 and self.all_odo[odo_found,0] - cur_t < 0.01 : #if it is less than 10ms
+            self.video.state.append_odo(cur_t,self.all_odo[odo_found,1:4]) #append real measured velocity at the current timestamp, which becomes a velocity prior factor in the optimizer
+
+        #tries to attach ZUPT/ODO at curr_t then appends the next imu sample.
 
         self.video.state.append_imu(self.all_imu[self.cur_imu_ii][0],\
                         self.all_imu[self.cur_imu_ii][4:7],\
@@ -268,36 +307,47 @@ class DBAFusionFrontend:
         self.cur_imu_ii += 1
 
         ## predict pose (<5 ms)
-        if self.video.imu_enabled:
+        #w -> world frame , b-> body frame, c-> camera frame
+        if self.video.imu_enabled: 
             Twc = (self.video.state.wTbs[-1] * self.video.Tbc).matrix()
-            TTT = torch.tensor(np.linalg.inv(Twc))
-            q = torch.tensor(Rotation.from_matrix(TTT[:3, :3]).as_quat())
-            t = TTT[:3,3]
-            self.video.poses[self.t1-1] = torch.cat([t,q])
+            TTT = torch.tensor(np.linalg.inv(Twc)) #world to camera frame
+            q = torch.tensor(Rotation.from_matrix(TTT[:3, :3]).as_quat()) #quaternion representation of rotation
+            t = TTT[:3,3] #slice rotation part
+            self.video.poses[self.t1-1] = torch.cat([t,q]) #final pose stored as a single 7 element tensor
 
         self.video.logger.info('manage edges')
 
         ## manage edges (60 ms)
+        #removing old edges using sliding window approach
+
         if self.graph.corr is not None:
-            if self.visual_only:
+            if self.visual_only: #always true
                 self.graph.rm_factors(torch.logical_and(self.graph.age > self.max_age,\
                 torch.logical_or(self.graph.ii < self.t1-self.active_window,self.graph.jj < self.t1-self.active_window)), store=True)
             else:
                 self.graph.rm_factors(torch.logical_or(self.graph.age > self.max_age,\
                 torch.logical_or(self.graph.ii < self.t1-self.active_window,self.graph.jj < self.t1-self.active_window)), store=True)
 
+        #adding new edges connects graphs that are close in space
+        #checks for keyframes in the entire map physically close to it
         self.graph.add_proximity_factors(self.t1-5, max(self.t1-self.frontend_window, 0), 
             rad=self.frontend_radius, nms=self.frontend_nms, thresh=self.frontend_thresh, beta=self.beta, remove=True)
 
         self.video.logger.info('non-keyframes %d' % self.graph.ii.shape[0])
 
         ## non-keyframe update
+        #fusing new depth infor into the existing map
         self.video.disps[self.t1-1] = torch.where(self.video.disps_sens[self.t1-1] > 0, 
            self.video.disps_sens[self.t1-1], self.video.disps[self.t1-1])
 
+        #performing motion only BA adjusting camera's current pose for non keyframes
         for itr in range(self.iters1):
             self.graph.update(None, None, use_inactive=True)
 
+
+        #graph rollup 
+        #long term slam session maintanence
+        # this is done so that we are not storing and optimizing over too many frames
         self.rollup = False
         if self.t1 > 65:
             self.__rollup(30)
@@ -369,8 +419,8 @@ class DBAFusionFrontend:
         else:
             cam_translation =  torch.norm((poses[(self.t1-6):(self.t1-3)] * poses[self.t1-2].inv()[None]).translation()[:,0:3],dim=1)
 
-        if (d.item() < self.keyframe_thresh or (self.video.imu_enabled and torch.sum(cam_translation < self.translation_threshold)>0)): # gnss
-            self.video.logger.info('remove new frame!!!!!!!!!!!!1')
+        if (d.item() < self.keyframe_thresh or (self.video.imu_enabled and torch.sum(cam_translation < self.translation_threshold)>0)): # gnss if there is no motion
+            self.video.logger.info('remove new frame!!!!!!!!!!!!!')
             self.graph.rm_keyframe(self.t1 - 2)
 
             # merge preintegration[self.t1-2] and preintegration[self.t1-3]
@@ -420,17 +470,18 @@ class DBAFusionFrontend:
         self.video.poses[self.t1] = self.video.poses[self.t1-1]
         self.video.disps[self.t1] = self.video.disps[self.t1-1].mean() * 1.0
 
-        self.video.dirty[self.graph.ii.min():self.t1] = True
+        self.video.dirty[self.graph.ii.min():self.t1] = True #mark all frames in the current optimization window as dirty for reprocessing
 
     def init_IMU(self):
         """ initialize IMU states """
-        cur_t = float(self.video.tstamp[self.t0].detach().cpu())
+        #static claibration of iMU
+        cur_t = float(self.video.tstamp[self.t0].detach().cpu()) #timestamp of the first camera frame
         for i in range(len(self.all_imu)):
-            if self.all_imu[i][0] < cur_t - 1e-6: continue
+            if self.all_imu[i][0] < cur_t - 1e-6: continue #loops through entire list of pre-loaded imu data to find the first sample with timestamp greater than the first image frame
             else:
                 self.cur_imu_ii = i
                 break
-
+        #iterate through all frames in the initial window
         for i in range(self.t0,self.t1):
             tt = self.video.tstamp[i]
             if i == self.t0:
@@ -481,11 +532,11 @@ class DBAFusionFrontend:
 
     def init_VI(self):
         """ initialize the V-I system, referring to VIN-Fusion """
-        sum_g = np.zeros(3,dtype = np.float64)
+        sum_g = np.zeros(3,dtype = np.float64) 
         ccount = 0
         for i in range(self.t1 - 8 ,self.t1-1):
             dt = self.video.state.preintegrations[i].deltaTij()
-            tmp_g = self.video.state.preintegrations[i].deltaVij()/dt
+            tmp_g = self.video.state.preintegrations[i].deltaVij()/dt #get acceleration
             sum_g += tmp_g
             ccount += 1
         aver_g = sum_g * 1.0 / ccount
@@ -493,16 +544,21 @@ class DBAFusionFrontend:
         for i in range(self.t1 - 8 ,self.t1-1):
             dt = self.video.state.preintegrations[i].deltaTij()
             tmp_g = self.video.state.preintegrations[i].deltaVij()/dt
-            var_g += np.linalg.norm(tmp_g - aver_g)**2
+            #IMU Excitation "has the device been moved enough to provide observability, low variance BAD ; High Variance GOOD"
+            var_g += np.linalg.norm(tmp_g - aver_g)**2 #calculate variange of gravity vectors
+
         var_g =math.sqrt(var_g/ccount)
+
+        #need to change this for a more production robust code
         if var_g < 0.25:
             print("IMU excitation not enough!",var_g)
         else:
+            # This block plots the trajectory *before* V-I alignment for comparison.
             poses = SE3(self.video.poses)
             self.plt_pos = [[],[]]
             self.plt_pos_ref = [[],[]]
             for i in range(0,self.t1):
-                ppp = np.matmul(poses[i].cpu().inv().matrix(),np.linalg.inv(self.video.Ti1c))[0:3,3]
+                ppp = np.matmul(poses[i].cpu().inv().matrix(),np.linalg.inv(self.video.Ti1c))[0:3,3] #pose of IMU in world frame
                 self.plt_pos[0].append(ppp[0])
                 self.plt_pos[1].append(ppp[1])
                 if self.all_gt is not None:
@@ -518,8 +574,12 @@ class DBAFusionFrontend:
                 plt.pause(0.1)
 
             if not self.visual_only:
+                #with level arm ignored to get an estimate
+                #then twice with false for refinement
+                # First, align without considering the camera-IMU lever arm.
                 self.VisualIMUAlignment(self.t1 - 8 ,self.t1, ignore_lever= True)
                 self.graph.update(None, None, use_inactive=True)
+                # Then, refine the alignment twice, this time including the lever arm.
                 self.VisualIMUAlignment(self.t1 - 8 ,self.t1, ignore_lever= False)
                 self.graph.update(None, None, use_inactive=True)
                 self.VisualIMUAlignment(self.t1 - 8 ,self.t1, ignore_lever= False)
@@ -532,12 +592,13 @@ class DBAFusionFrontend:
                 self.VisualIMUAlignment(self.t1 - 8 ,self.t1, ignore_lever= False)
                 self.visual_only_init = True
 
+            #set prior for next optimization
             self.video.set_prior(self.video.last_t0,self.t1)
 
             self.plt_pos = [[],[]]
             self.plt_pos_ref = [[],[]]
             for i in range(0,self.t1):
-                TTT = self.video.state.wTbs[i].matrix()
+                TTT = self.video.state.wTbs[i].matrix() # Get the final pose from the state.
                 ppp = TTT[0:3,3]
                 qqq = Rotation.from_matrix(TTT[:3, :3]).as_quat()
                 self.result_file.writelines('%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n'%(self.video.tstamp[i],ppp[0],ppp[1],ppp[2]\
@@ -558,17 +619,20 @@ class DBAFusionFrontend:
                 plt.plot(self.plt_pos[0],self.plt_pos[1],marker='^')
                 plt.plot(self.plt_pos_ref[0],self.plt_pos_ref[1],marker='^')
                 plt.pause(0.1)
-
+            #final refinement
             for itr in range(1):
                 self.graph.update(None, None, use_inactive=True)
 
     def init_GNSS(self):
         """ initialize the GNSS for geo-referencing fusion """
+        # Set the origin of the local tangent plane from ground truth.
         ten0 = np.array([self.all_gt[self.all_gt_keys[0]]['X0'],\
                          self.all_gt[self.all_gt_keys[0]]['Y0'],\
                          self.all_gt[self.all_gt_keys[0]]['Z0']])
         self.video.ten0 = ten0
         tn0 = []; tw =[]
+        # Loop through the last 10 valid poses.
+        #Align the SLAM trajectory with GNSS positions to recover the scale and rotation.
         for i in range(len(self.video.state.wTbs) - 10,len(self.video.state.wTbs)):
             if self.video.state.gnss_valid[i]:
                 # if not is_ref_set:
@@ -577,7 +641,11 @@ class DBAFusionFrontend:
                 teg = self.video.state.gnss_position[i]
                 print(self.video.ten0)
                 print(self.video.state.gnss_position[i])
+                #ENU frame, east north up
+                # 3D position of the device in the simple, flat, easy-to-use East-North-Up coordinate system.
                 tn0g = np.matmul(trans.Cen(self.video.ten0).T,(self.video.state.gnss_position[i] - self.video.ten0))
+                #twb => slam system internal world frame
+                 # Get the corresponding SLAM pose's translation.
                 twb = self.video.state.wTbs[i].translation()
                 tn0.append(tn0g)
                 tw.append(twb)
@@ -589,32 +657,43 @@ class DBAFusionFrontend:
             if bl < 10.0:
                 print('Baseline too short!!')
                 return
+            # Calculate the heading (direction of travel) in both coordinate systems.
             heading_w = math.atan2(tw[-1,1]-tw[0,1],tw[-1,0]-tw[0,0])
             heading_n0 = math.atan2(tn0[-1,1]-tn0[0,1],tn0[-1,0]-tn0[0,0])
+            # Calculate the distance traveled (scale) in both systems.
             s_w = np.linalg.norm(tw[-1] - tw[0])
             s_n0 = np.linalg.norm(tn0[-1] - tn0[0])
-
+            # 1. Solve for Scale
             s = s_n0 / s_w
+            # 2. Solve for Rotation
             Rn0w = trans.att2m(np.array([.0,.0,-heading_w + heading_n0]))
+            # 3. Solve for Translation
             tn0w = tn0  - np.matmul(Rn0w,tw.T * s).T
 
+            # Apply the similarity transform to all the poses and velocities in the sliding window in the world frame.
             poses = SE3(self.video.poses)
             wTcs = poses.inv().matrix().cpu().numpy()
             wTbs = np.matmul(wTcs,self.video.Tbc.inverse().matrix())
+             # Transform all historical body poses (wTbs)
             wTbs[:,0:3,3] = np.matmul(Rn0w,(wTbs[:,0:3,3]*s).T).T + tn0w[0]
             wTbs[:,0:3,0:3] = np.matmul(Rn0w, (wTbs[:,0:3,0:3]).T).T
             
             self.refTw = np.eye(4,4)
             
+            # Loop through every keyframe from the beginning (0 to t1)
             for i in range(0,self.t1):
+                 # Update the body poses in the state
                 self.video.state.wTbs[i] = gtsam.Pose3(wTbs[i])
+                # Scale the velocities
                 self.video.state.vs[i] *=  s
             wTcs = np.matmul(wTbs,self.video.Tbc.matrix())
             for i in range(0,self.t1):
                 TTT = np.linalg.inv(wTcs[i])
                 q = torch.tensor(Rotation.from_matrix(TTT[:3, :3]).as_quat())
                 t = torch.tensor(TTT[:3,3])
+                # ... convert wTcs back to t,q format and update video.poses ...
                 self.video.poses[i] = torch.cat([t,q])
+                # Scale the disparity (inverse depth) map
                 self.video.disps[i] /= s
 
             self.video.gnss_init_t1 = self.t1
