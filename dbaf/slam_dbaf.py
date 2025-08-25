@@ -17,6 +17,7 @@ class DBAFusion:
     def __init__(self, args):
         super(DBAFusion, self).__init__()
         self.load_weights(args.weights) # load DroidNet weights
+        #CHECK IF WE CAN TRAIN OUR OWN DROIDNET MODEL
         self.args = args
 
         # store images, depth, poses, intrinsics (shared between processes)

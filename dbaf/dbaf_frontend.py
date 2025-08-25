@@ -1,3 +1,7 @@
+#currently the VIO is turned off and we don't imu buffer . TRY TO TURN IT ON
+#try tweaking zupt logic for better imu drift correction
+#try tweaking the number of iterations for non keyframe update and keyframe update. self.iters1 and self.iters2 (both are for nonkey frames)
+
 import torch
 import torchvision
 import numpy as np
@@ -20,57 +24,71 @@ class DBAFusionFrontend:
         self.graph = CovisibleGraph(video, net.update, args=args)
 
         # local optimization window
+        #the range over which we perform DBA optimization t0 start index, t1 end index
         self.t0 = 0
         self.t1 = 0
 
         # frontend variables
-        self.is_initialized = False
-        self.count = 0
-
+        self.is_initialized = False #to see if slam system has been initialized
+        self.count = 0 #frame counter for frontend operations
+        # sets the numer of frames for initial stabilization before main slam process starts.
+        #default is 12
         self.warmup = args.warmup
         self.vi_warmup = 12
         if 'vi_warmup' in args: self.vi_warmup = args.vi_warmup
-        self.beta = args.beta
-        self.frontend_nms = args.frontend_nms
-        self.keyframe_thresh = args.keyframe_thresh
-        self.frontend_window = args.frontend_window
-        self.frontend_thresh = args.frontend_thresh
-        self.frontend_radius = args.frontend_radius
+
+        self.beta = args.beta #decides if frames are covisible or not, used in droidnet,only frames that are close enough are connected by edges
+        self.frontend_nms = args.frontend_nms #NMS used to avoid adding redundant edges only information dense edges are added
+        self.keyframe_thresh = args.keyframe_thresh #to decide when to add a keyframe , motion_filter.py currently set at 2.5
+        self.frontend_window = args.frontend_window #size of window for frontend optimization, number of frames considered
+        self.frontend_thresh = args.frontend_thresh #threshold for frontend edge selection
+        self.frontend_radius = args.frontend_radius #how far apart can two frames be to be considered for an edge
 
         ### DBAFusion
+        #buffer for imu data
         self.all_imu = None
+        #buffer for current index of imu data
         self.cur_imu_ii = 0
-        self.is_init = False
-        self.all_gnss = None
+        #init routine for imu data
+        self.is_init = False #try with true
+        self.all_gnss = None #
+
+        ####BUFFER FOR ODOM DATA####
         self.all_odo = None
         self.all_gt = None
         self.all_gt_keys = None
         self.all_stamp = None
         self.cur_stamp_ii = 0
+
+        #FLAG FOR RUNNING in visual odometry mode no IMU
         self.visual_only = args.visual_only
         self.visual_only_init = False
-        self.translation_threshold = 0.0
-        self.active_window = args.active_window
-        self.high_freq_output = True
-        self.zupt = ('use_zupt' in args and args.use_zupt)
+        self.translation_threshold = 0.0 #Threshold for translation to trigger keyframe logic
+        self.active_window = args.active_window #size of activation optimization window how many recent frames are added to the optimization window
+        self.high_freq_output = True #used in update logic for pose prediction.
+        self.zupt = ('use_zupt' in args and args.use_zupt) #zero velocity update flag for imu drift correction
 
         if  not self.visual_only:
-            self.max_age = 25
-            self.iters1 = 2
-            self.iters2 = 1
+            self.max_age = 25 #number of frames since creation after which an edge is removed
+            self.iters1 = 2 #number of iterations for non keyframe update more iterations means more accuracy
+            self.iters2 = 1 #number of iterations for keyframe update
         else:
             self.max_age = 25
             self.iters1 = 4
             self.iters2 = 2
 
         # visualization/output
-        self.show_plot = args.show_plot
+        self.show_plot = args.show_plot #enable/disable vizulization
         self.result_file = open(args.resultpath,'wt')
+        
+        ### PLOT VARIABLES ###
         self.plt_pos     = [[],[]]    # X, Y
         self.plt_pos_ref = [[],[]]    # X, Y
         self.plt_att     = [[],[],[]] # pitch, roll, yaw
         self.plt_bg      = [[],[],[]] # X, Y, Z
         self.plt_t       = []
+
+        #
         self.refTw       = np.eye(4,4)
 
         if self.show_plot:
@@ -82,27 +100,31 @@ class DBAFusionFrontend:
             plt.ion()
             plt.pause(0.1)
 
+    #used for evaluating pose error if ground truth is available
     def get_pose_ref(self, tt:float):
         tt_found = self.all_gt_keys[bisect.bisect(self.all_gt_keys,tt)]
         return tt_found, self.all_gt[tt_found]
     
     def __rollup(self, roll):
         """ roll up window states to save memory """
-        self.t1 -= roll
-        self.count -= roll
-        self.video.counter.value -= roll
-        self.video.tstamp     = torch.roll(self.video.tstamp    ,-roll,0) 
-        self.video.images     = torch.roll(self.video.images    ,-roll,0) 
-        self.video.dirty      = torch.roll(self.video.dirty     ,-roll,0) 
+        self.t1 -= roll #moves the end index of the optimization window back by roll
+        self.count -= roll #decreases the frame counter by roll
+        self.video.counter.value -= roll #shared frame counder
+
+        self.video.tstamp     = torch.roll(self.video.tstamp    ,-roll,0)  #shift timestamps buffer forward by roll frames, discard old and keep new
+        self.video.images     = torch.roll(self.video.images    ,-roll,0) #shift image buffer 
+        self.video.dirty      = torch.roll(self.video.dirty     ,-roll,0) #shift dirty buffer flag
         self.video.red        = torch.roll(self.video.red       ,-roll,0) 
-        self.video.poses      = torch.roll(self.video.poses     ,-roll,0) 
-        self.video.disps      = torch.roll(self.video.disps     ,-roll,0) 
-        self.video.disps_sens = torch.roll(self.video.disps_sens,-roll,0) 
-        self.video.disps_up   = torch.roll(self.video.disps_up  ,-roll,0) 
-        self.video.intrinsics = torch.roll(self.video.intrinsics,-roll,0) 
-        self.video.fmaps      = torch.roll(self.video.fmaps     ,-roll,0) 
-        self.video.nets       = torch.roll(self.video.nets      ,-roll,0) 
-        self.video.inps       = torch.roll(self.video.inps      ,-roll,0) 
+        self.video.poses      = torch.roll(self.video.poses     ,-roll,0) #shifts pose buffer
+        self.video.disps      = torch.roll(self.video.disps     ,-roll,0) #disparity buffer
+        self.video.disps_sens = torch.roll(self.video.disps_sens,-roll,0) #sensor disparity buffer
+        self.video.disps_up   = torch.roll(self.video.disps_up  ,-roll,0) #upsampled disparity buffer
+        self.video.intrinsics = torch.roll(self.video.intrinsics,-roll,0) #intrinsics buffer
+        self.video.fmaps      = torch.roll(self.video.fmaps     ,-roll,0) #feature map buffer
+        self.video.nets       = torch.roll(self.video.nets      ,-roll,0) #context netwrk output buffer
+        self.video.inps       = torch.roll(self.video.inps      ,-roll,0) #input feature buffer
+
+
         self.graph.ii -= roll
         self.graph.jj -= roll
         self.graph.ii_inac -= roll
@@ -856,7 +878,7 @@ class DBAFusionFrontend:
         # do initialization
         if not self.is_initialized and self.video.counter.value == self.warmup:
             self.__initialize()
-        # do update
+        # do updateß
         elif self.is_initialized and self.t1 < self.video.counter.value:
             self.__update()
 
