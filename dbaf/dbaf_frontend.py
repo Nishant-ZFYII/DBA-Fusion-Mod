@@ -661,11 +661,13 @@ class DBAFusionFrontend:
             heading_w = math.atan2(tw[-1,1]-tw[0,1],tw[-1,0]-tw[0,0])
             heading_n0 = math.atan2(tn0[-1,1]-tn0[0,1],tn0[-1,0]-tn0[0,0])
             # Calculate the distance traveled (scale) in both systems.
-            s_w = np.linalg.norm(tw[-1] - tw[0])
-            s_n0 = np.linalg.norm(tn0[-1] - tn0[0])
+            s_w = np.linalg.norm(tw[-1] - tw[0]) #estimated distance travelled according to slam
+            s_n0 = np.linalg.norm(tn0[-1] - tn0[0]) #true distance travelled according to GNSS
             # 1. Solve for Scale
             s = s_n0 / s_w
             # 2. Solve for Rotation
+            #assuming that the ground is flat we only need z axis
+            #difference in the direction of travel betwenn the GNSS and slam system.
             Rn0w = trans.att2m(np.array([.0,.0,-heading_w + heading_n0]))
             # 3. Solve for Translation
             tn0w = tn0  - np.matmul(Rn0w,tw.T * s).T
@@ -674,7 +676,7 @@ class DBAFusionFrontend:
             poses = SE3(self.video.poses)
             wTcs = poses.inv().matrix().cpu().numpy()
             wTbs = np.matmul(wTcs,self.video.Tbc.inverse().matrix())
-             # Transform all historical body poses (wTbs)
+            # Transform all historical body poses (wTbs)
             wTbs[:,0:3,3] = np.matmul(Rn0w,(wTbs[:,0:3,3]*s).T).T + tn0w[0]
             wTbs[:,0:3,0:3] = np.matmul(Rn0w, (wTbs[:,0:3,0:3]).T).T
             
@@ -686,6 +688,8 @@ class DBAFusionFrontend:
                 self.video.state.wTbs[i] = gtsam.Pose3(wTbs[i])
                 # Scale the velocities
                 self.video.state.vs[i] *=  s
+
+            #calculate the pose of the camera from the newly alignes pose of the body/IMU
             wTcs = np.matmul(wTbs,self.video.Tbc.matrix())
             for i in range(0,self.t1):
                 TTT = np.linalg.inv(wTcs[i])
@@ -696,13 +700,17 @@ class DBAFusionFrontend:
                 # Scale the disparity (inverse depth) map
                 self.video.disps[i] /= s
 
+            #flags to prevent gnss re-init
             self.video.gnss_init_t1 = self.t1
             self.video.gnss_init_time = self.video.tstamp[self.t1-1]
             
+            #set prior for next batch of optimization
             self.video.set_prior(self.video.last_t0,self.t1)
 
             self.plt_pos = [[],[]]
             self.plt_pos_ref = [[],[]]
+
+            #viz plotting loop
             for i in range(0,self.t1):
                 TTT = self.video.state.wTbs[i].matrix()
                 ppp = TTT[0:3,3]
@@ -731,31 +739,56 @@ class DBAFusionFrontend:
             print('GNSS initialized!!!!')
 
     def VisualIMUAlignment(self, t0, t1, ignore_lever, disable_scale = False):
+
+        ''' Linear Least Square Alignment of Visual and Inertial Systems
+            1. Preparing the pose
+            2.
+            3.
+            4.
+             
+              
+               
+                 '''
+        # Get the visual-only camera poses (wTc)
         poses = SE3(self.video.poses)
         wTcs = poses.inv().matrix().cpu().numpy()
 
-        if not ignore_lever:
+        
+        if not ignore_lever: #for extrict calibration
+             # The standard, precise conversion using the full camera-to-body transform.
             wTbs = np.matmul(wTcs,self.video.Tbc.inverse().matrix())
         else:
+            # A simplified conversion for the initial "coarse" alignment.
+            # It temporarily sets the translation part to zero, treating camera and IMU
+            # as if they are at the same point.
             T_tmp = self.video.Tbc.inverse().matrix()
-            T_tmp[0:3,3] = 0.0
+            T_tmp[0:3,3] = 0.0 
             wTbs = np.matmul(wTcs,T_tmp)
         cost = 0.0
 
         # solveGyroscopeBias
         A = np.zeros([3,3])
         b = np.zeros(3)
-        H1 =np.zeros([15,6], order='F', dtype=np.float64)
-        H2 =np.zeros([15,3], order='F', dtype=np.float64)
-        H3 =np.zeros([15,6], order='F', dtype=np.float64)
-        H4 =np.zeros([15,3], order='F', dtype=np.float64)
-        H5 =np.zeros([15,6], order='F', dtype=np.float64) # navstate wrt. bias
-        H6 =np.zeros([15,6], order='F', dtype=np.float64)
+        # Jacobian matrix
+        H1 =np.zeros([15,6], order='F', dtype=np.float64) #jacobian error wrt to pose 1st key frame
+        H2 =np.zeros([15,3], order='F', dtype=np.float64) #jacobian error wrt to velocity 1st keyframe
+        H3 =np.zeros([15,6], order='F', dtype=np.float64)#jacobian error wrt to pose 2nd keyframe
+        H4 =np.zeros([15,3], order='F', dtype=np.float64)#jacobian error wrt to velocity 2nd keyframe
+        H5 =np.zeros([15,6], order='F', dtype=np.float64) #jacobian error wrt to IMU Bias 1st keyframe# navstate wrt. bias
+        H6 =np.zeros([15,6], order='F', dtype=np.float64)#jacobian error wrt to IMU Bias 2nd keyframe
+
+        # this is the code for solving the gyroscope bias bg
+        # Linear least squares optimization problem
+        # finds the relationship between two consecutive states using preintegrated IMU measurement
         for i in range(t0,t1-1):
             pose_i = gtsam.Pose3(wTbs[i])
             pose_j = gtsam.Pose3(wTbs[i+1])
             Rij = np.matmul(pose_i.rotation().matrix().T,pose_j.rotation().matrix())
-            imu_factor = gtsam.gtsam.CombinedImuFactor(0,1,2,3,4,5,self.video.state.preintegrations[i])
+            #this is where we get relationship between t and t+1 timestamp
+            imu_factor = gtsam.gtsam.CombinedImuFactor(0,1,2,3,4,5,self.video.state.preintegrations[i]) 
+            #This is the key calculation. It compares the visual motion (pose_i, pose_j) with imu prediction motion.
+            #err is the 9-D vector of disagreement (3D rot-err, 3D pos erroe, 3D vel err)
+            #populated H matrices with jacobians
             err = imu_factor.evaluateErrorCustom(pose_i,self.video.state.vs[i],\
                                                  pose_j,self.video.state.vs[i+1],\
                 self.video.state.bs[i],self.video.state.bs[i+1],\
