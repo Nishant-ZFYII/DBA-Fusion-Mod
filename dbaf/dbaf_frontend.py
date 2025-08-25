@@ -113,35 +113,43 @@ class DBAFusionFrontend:
 
         self.video.tstamp     = torch.roll(self.video.tstamp    ,-roll,0)  #shift timestamps buffer forward by roll frames, discard old and keep new
         self.video.images     = torch.roll(self.video.images    ,-roll,0) #shift image buffer 
-        self.video.dirty      = torch.roll(self.video.dirty     ,-roll,0) #shift dirty buffer flag
-        self.video.red        = torch.roll(self.video.red       ,-roll,0) 
+        self.video.dirty      = torch.roll(self.video.dirty     ,-roll,0) #shift dirty buffer flag frames that need to be reoptimized or re processed
+        self.video.red        = torch.roll(self.video.red       ,-roll,0) #outlier frames, with errors, or needed to be excluded from optimzaiton
         self.video.poses      = torch.roll(self.video.poses     ,-roll,0) #shifts pose buffer
         self.video.disps      = torch.roll(self.video.disps     ,-roll,0) #disparity buffer
-        self.video.disps_sens = torch.roll(self.video.disps_sens,-roll,0) #sensor disparity buffer
+        self.video.disps_sens = torch.roll(self.video.disps_sens,-roll,0) #sensor disparity buffer for VIO
         self.video.disps_up   = torch.roll(self.video.disps_up  ,-roll,0) #upsampled disparity buffer
         self.video.intrinsics = torch.roll(self.video.intrinsics,-roll,0) #intrinsics buffer
         self.video.fmaps      = torch.roll(self.video.fmaps     ,-roll,0) #feature map buffer
         self.video.nets       = torch.roll(self.video.nets      ,-roll,0) #context netwrk output buffer
         self.video.inps       = torch.roll(self.video.inps      ,-roll,0) #input feature buffer
 
-
-        self.graph.ii -= roll
+        #decrement indices of edges for consistency
+        self.graph.ii -= roll 
         self.graph.jj -= roll
-        self.graph.ii_inac -= roll
+        #decrement indices for inactive edges
+        self.graph.ii_inac -= roll 
         self.graph.jj_inac -= roll
+        #finds valid inactive edges filters out edges belonigng to rolled out frames
         rm_inac_index = torch.logical_and(torch.greater_equal(self.graph.ii_inac,0),torch.greater_equal(self.graph.jj_inac,0))
+        #clean up inactive edge list
         self.graph.ii_inac = self.graph.ii_inac[rm_inac_index]
         self.graph.jj_inac = self.graph.jj_inac[rm_inac_index]
+        #update target buffer for inactive edges
         self.graph.target_inac = self.graph.target_inac[:,rm_inac_index,:,:,:]
         self.graph.weight_inac = self.graph.weight_inac[:,rm_inac_index,:,:,:] # need test
-
+        #decrement bad edges
         self.graph.ii_bad  -= roll
         self.graph.jj_bad  -= roll
-
+        #update  last optimization window indices
         self.video.last_t0 -= roll
         self.video.last_t1 -= roll
+
+        #updates current indeces for graph optimization
         self.video.cur_ii  -= roll
         self.video.cur_jj  -= roll
+
+        #if imu is used, update the factor graph and optimization result
         if self.video.imu_enabled:
             graph_temp = gtsam.NonlinearFactorGraph()
             for i in range(self.video.cur_graph.size()):
@@ -161,22 +169,40 @@ class DBAFusionFrontend:
             self.video.cur_result = result_temp
             self.video.marg_factor = self.video.marg_factor.rekey((np.array(self.video.marg_factor.keys())-roll).tolist())
 
+        #remove old states from IMU buffer keep only recent states
         self.video.state.timestamps           = self.video.state.timestamps           [roll:]
-        self.video.state.wTbs                 = self.video.state.wTbs                 [roll:]
-        self.video.state.vs                   = self.video.state.vs                   [roll:]
-        self.video.state.bs                   = self.video.state.bs                   [roll:]
-        self.video.state.preintegrations      = self.video.state.preintegrations      [roll:]
-        self.video.state.preintegrations_meas = self.video.state.preintegrations_meas [roll:]
-        self.video.state.gnss_valid           = self.video.state.gnss_valid           [roll:]
-        self.video.state.gnss_position        = self.video.state.gnss_position        [roll:]
-        self.video.state.odo_valid            = self.video.state.odo_valid            [roll:]
-        self.video.state.odo_vel              = self.video.state.odo_vel              [roll:]
+        self.video.state.wTbs                 = self.video.state.wTbs                 [roll:] #posees
+        self.video.state.vs                   = self.video.state.vs                   [roll:] #velocities
+        self.video.state.bs                   = self.video.state.bs                   [roll:] #biases
+        self.video.state.preintegrations      = self.video.state.preintegrations      [roll:] #imu preintegration
+        self.video.state.preintegrations_meas = self.video.state.preintegrations_meas [roll:] #raw imu measurements
+        self.video.state.gnss_valid           = self.video.state.gnss_valid           [roll:] #gnss validity
+        self.video.state.gnss_position        = self.video.state.gnss_position        [roll:] #gnss positions
+        self.video.state.odo_valid            = self.video.state.odo_valid            [roll:] #odom validity flag
+        self.video.state.odo_vel              = self.video.state.odo_vel              [roll:] #odom velocity
 
     def __update(self):
-        """ add edges, perform update """
+        """ add edges, perform update 
+        
+        Main function called after a new frame is processes.
+
+        1. integrates imu data into the state
+        2. predict the pose for the new frame
+        3. manage and update factor graph
+        4 DBA optimization
+        5. o/p result and update validation
+        6. Handle keyframe logic and memory management
+        7. attempt initialization of VI/GNSS if needed.
+        
+        
+        
+        """
+        #frame and state counters
         self.count += 1
         self.t1 += 1
 
+        #imu reinitialization cost
+        #tracks the timestamp of the last imu init. Track this to find if we neeed to trigger a new one.
         if self.video.imu_enabled and (self.video.tstamp[self.t1-1] - self.video.vi_init_time > 5.0):
             self.video.reinit = True
             self.video.vi_init_time = 1e9
