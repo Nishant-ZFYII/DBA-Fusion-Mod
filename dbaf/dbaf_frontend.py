@@ -817,32 +817,43 @@ class DBAFusionFrontend:
         
         # linearAlignment
         all_frame_count = t1 - t0
+        #3 for Velocity from frame, 3 for IMU components, 1 for scale
         n_state = all_frame_count * 3 + 3 + 1
         A = np.zeros([n_state,n_state])
         b = np.zeros(n_state)
         i_count = 0
         for i in range(t0,t1-1):
+            # Get the camera poses at time i and i+1, and extract their rotation (R) and translation (t).
             pose_i = gtsam.Pose3(wTbs[i])
             pose_j = gtsam.Pose3(wTbs[i+1])
+            #rotation matrix wrt to global frame.
             R_i = pose_i.rotation().matrix()
             t_i = pose_i.translation()
             R_j = pose_j.rotation().matrix()
             t_j = pose_j.translation()
             pim = self.video.state.preintegrations[i]
             tic = self.video.Tbc.translation()
-
+            #tmp_A -> rows -> 3pos, 3vel; Col -> vel_i, vel_j, grav, scale
             tmp_A = np.zeros([6,10])
             tmp_b = np.zeros(6)
             dt = pim.deltaTij()
+            #inital vel_i
             tmp_A[0:3,0:3] = -dt * np.eye(3,3)
+            #1/2 at^2 component => accounts for gravity over position interval
             tmp_A[0:3,6:9] = R_i.T * dt * dt / 2
+            #change in position from scale factor
             tmp_A[0:3,9] = np.matmul(R_i.T, t_j-t_i) / 100.0
+            #this is the ground truth measurement of the imu values. raw position data
             tmp_b[0:3] = pim.deltaPij()
+            #derivative of vel eqn wrt to vel_i.
             tmp_A[3:6,0:3] = -np.eye(3,3)
+            #rotation between frames
             tmp_A[3:6,3:6] = np.matmul(R_i.T, R_j)
+            #gravity vector derivative 
             tmp_A[3:6,6:9] = R_i.T * dt
+            #raw velocity data
             tmp_b[3:6] = pim.deltaVij()
-
+            #this is an overdetermined linear system
             r_A = np.matmul(tmp_A.T,tmp_A)
             r_b = np.matmul(tmp_A.T,tmp_b)
 
@@ -871,12 +882,18 @@ class DBAFusionFrontend:
         b = np.zeros(n_state)
 
         for k in range(4):
+             # === This section creates a 2D basis on the tangent plane of the gravity vector ===
+            # 'aa' is the current normalized gravity direction.
             aa = g / np.linalg.norm(g)
-            tmp = np.array([.0,.0,1.0])
-
-            bb = (tmp - np.dot(aa,tmp) * aa)
-            bb /= np.linalg.norm(bb)
+            tmp = np.array([.0,.0,1.0]) # An arbitrary "up" vector.
+            #Gram-Schmidt orthogonalization. find tmp that is perfectly perpendicular to aa.
+            bb = (tmp - np.dot(aa,tmp) * aa) #projection
+            bb /= np.linalg.norm(bb) #normilization
+            #create a 2d tangent plane to the 3D gravity vector as we know the z is 9.81 .
+            #2nd basis vector to the tangent plane
             cc = np.cross(aa,bb)
+            #now we have 3 perpendicular vectors -> aa(norm grav vector) bb-> perpend. project cc-> perpendicular to aa and bb
+            #2d plane representation of our gravity vector
             bc = np.zeros([3,2])
             bc[0:3,0] = bb
             bc[0:3,1] = cc
@@ -939,8 +956,13 @@ class DBAFusionFrontend:
             self.video.state.vs[i+t0] = np.matmul(wTbs[i+t0,0:3,0:3],x[i*3:i*3+3])
         
         # g2R
+        #final gravity estimate
         ng1 = g0/ np.linalg.norm(g0)
         ng2 = np.array([0,0,1.0])
+        # It calculates the rotation matrix (R0)
+        # that will rotate the measured gravity direction (ng1) to align perfectly
+        # with the desired world "up" direction (ng2). The trans.FromTwoVectors function
+        # is a helper that computes this rotation.
         R0 = trans.FromTwoVectors(ng1,ng2)
         yaw = trans.R2ypr(R0)[0]
         R0 = np.matmul(trans.ypr2R(np.array([-yaw,0,0])),R0)
