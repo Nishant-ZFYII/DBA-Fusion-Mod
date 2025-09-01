@@ -789,17 +789,22 @@ class DBAFusionFrontend:
             #This is the key calculation. It compares the visual motion (pose_i, pose_j) with imu prediction motion.
             #err is the 9-D vector of disagreement (3D rot-err, 3D pos erroe, 3D vel err)
             #populated H matrices with jacobians
+            #err is 9 dimension 3D rotational err, accl err, gyro err.
             err = imu_factor.evaluateErrorCustom(pose_i,self.video.state.vs[i],\
                                                  pose_j,self.video.state.vs[i+1],\
                 self.video.state.bs[i],self.video.state.bs[i+1],\
                     H1,H2,H3,H4,H5,H6)
-            tmp_A = H5[0:3,3:6]
-            tmp_b = err[0:3]
+            tmp_A = H5[0:3,3:6] #rotaion error of the gyro IMU values in the jacobi matrix of 1st frame
+            tmp_b = err[0:3] #compute the rotation between the gyro jacobi of the 
             cost +=  np.dot(tmp_b,tmp_b)
+            #A*x = b
             A += np.matmul(tmp_A.T,tmp_A)
             b += np.matmul(tmp_A.T,tmp_b)
+        #here we solve for x
         bg = -np.matmul(np.linalg.inv(A),b)
 
+        #throw away the old preintegrated summaries and we and create new ones with a much better bg values.
+        #
         for i in range(0,t1-1):
             pim = gtsam.PreintegratedCombinedMeasurements(self.video.state.params,\
                   gtsam.imuBias.ConstantBias(np.array([.0,.0,.0]),bg))
